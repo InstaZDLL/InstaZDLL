@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# === Config ===
+WAN_IF="enp0s3"              # interface NAT (Internet)
+LAN_IF="enp0s8"              # interface intnet
+LAN_IP_CIDR="10.0.2.254/24"  # IP du routeur sur le LAN (intnet)
+NETPLAN_FILE="/etc/netplan/01-router.yaml"
+
+if [[ $EUID -ne 0 ]]; then
+  echo "Erreur: lance ce script en root (sudo)."
+  exit 1
+fi
+
+echo "[1/6] Installation des paquets nécessaires..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y iptables iptables-persistent netfilter-persistent
+
+echo "[2/6] Configuration Netplan (WAN DHCP, LAN statique)..."
+if [[ -f "$NETPLAN_FILE" ]]; then
+  cp -a "$NETPLAN_FILE" "${NETPLAN_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+  echo "  Backup créé: ${NETPLAN_FILE}.bak.*"
+fi
+
+cat > "$NETPLAN_FILE" <<EOF
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    ${WAN_IF}:
+      dhcp4: true
+    ${LAN_IF}:
+      dhcp4: false
+      addresses:
+        - ${LAN_IP_CIDR}
+EOF
+
+netplan apply
+
+echo "[3/6] Activation du routage IPv4 (ip_forward)..."
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+# Persistance
+if grep -q '^net.ipv4.ip_forward=' /etc/sysctl.conf; then
+  sed -i 's/^net\.ipv4\.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+else
+  echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+fi
+sysctl -p >/dev/null
+
+echo "[4/6] Mise en place des règles iptables (NAT + FORWARD)..."
+
+# Nettoyage ciblé des règles liées (évite les doublons si relancé)
+iptables -t nat -D POSTROUTING -o "$WAN_IF" -j MASQUERADE 2>/dev/null || true
+iptables -D FORWARD -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i "$WAN_IF" -o "$LAN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+
+# Ajout règles
+iptables -t nat -A POSTROUTING -o "$WAN_IF" -j MASQUERADE
+iptables -A FORWARD -i "$LAN_IF" -o "$WAN_IF" -j ACCEPT
+iptables -A FORWARD -i "$WAN_IF" -o "$LAN_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+echo "[5/6] Sauvegarde persistante des règles..."
+netfilter-persistent save
+
+echo "[6/6] Résumé / vérifications..."
+echo "Interfaces:"
+ip -br a | sed 's/^/  /'
+echo
+echo "ip_forward:"
+sysctl net.ipv4.ip_forward | sed 's/^/  /'
+echo
+echo "NAT rules:"
+iptables -t nat -S POSTROUTING | grep -E "MASQUERADE|POSTROUTING" | sed 's/^/  /' || true
+echo
+echo "Forward rules:"
+iptables -S FORWARD | sed 's/^/  /'
+
+echo
+echo "✅ Terminé."
+echo "Sur tes autres VM (intnet):"
+echo "  - Passerelle (gateway): 10.0.2.254"
+echo "  - DNS: 1.1.1.1 (ou ton DNS interne)"
